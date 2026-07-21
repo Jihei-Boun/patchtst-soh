@@ -501,6 +501,180 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, np.ndarray, np.nd
     return float(np.mean(losses)), np.concatenate(preds), np.concatenate(trues)
 
 
+def resolve_report_path(out_dir: str) -> str:
+    """실험별 폴더가 아니라 outputs/Experiment_Report.md 하나만 유지합니다."""
+    abs_out = os.path.abspath(out_dir)
+    parent_name = os.path.basename(os.path.dirname(abs_out))
+    base_name = os.path.basename(abs_out)
+    if parent_name == "outputs":
+        return os.path.join(os.path.dirname(abs_out), "Experiment_Report.md")
+    if base_name == "outputs":
+        return os.path.join(abs_out, "Experiment_Report.md")
+    return os.path.join(abs_out, "Experiment_Report.md")
+
+
+def _existing_report_mae(report_path: str) -> float | None:
+    if not os.path.isfile(report_path):
+        return None
+    try:
+        with open(report_path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("| MAE |"):
+                    return float(line.split("|")[2].strip())
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def write_experiment_report(
+    out_dir: str,
+    metrics: dict,
+    train_losses: List[float],
+    val_losses: List[float],
+    env_info: dict | None = None,
+) -> str | None:
+    """단일 outputs/Experiment_Report.md에 best(MAE 최저) 결과만 기록합니다."""
+    env_info = env_info or {}
+    best_epoch = int(metrics.get("best_epoch", 0) or 0)
+    best_val = float(metrics.get("best_val_loss", float("nan")))
+    mae = float(metrics.get("test_mae", float("nan")))
+    mse = float(metrics.get("test_mse", float("nan")))
+    rmse = float(metrics.get("test_rmse", float("nan")))
+    feature_cols = metrics.get("feature_cols", [])
+    vehicle_ids = metrics.get("vehicle_ids", [])
+    data_paths = metrics.get("data_paths", [])
+
+    report_path = resolve_report_path(out_dir)
+    prev_mae = _existing_report_mae(report_path)
+    if prev_mae is not None and mae >= prev_mae:
+        print(
+            f"[INFO] Experiment_Report.md 유지 "
+            f"(기존 MAE={prev_mae:.6f} <= 현재 MAE={mae:.6f})"
+        )
+        return None
+
+    run_name = os.path.basename(os.path.abspath(out_dir).rstrip(os.sep))
+    report_dir = os.path.dirname(os.path.abspath(report_path))
+    if os.path.basename(report_dir) == "outputs" and run_name != "outputs":
+        img_prefix = f"{run_name}/"
+    else:
+        img_prefix = ""
+
+    epoch_rows = []
+    for i, (tr, va) in enumerate(zip(train_losses, val_losses), start=1):
+        mark = " **(best)**" if i == best_epoch else ""
+        epoch_rows.append(f"| {i} | {tr:.6f} | {va:.6f}{mark} |")
+
+    vehicle_rows = []
+    for vid, vm in (metrics.get("vehicles") or {}).items():
+        vehicle_rows.append(
+            f"| {vid} | {vm['mae']:.4f} | {vm['rmse']:.4f} | {vm.get('n', '-')} |"
+        )
+
+    feature_text = ", ".join(feature_cols) if feature_cols else "-"
+    data_text = ", ".join(os.path.basename(p) for p in data_paths) if data_paths else "-"
+    period = metrics.get("data_period", "2022-12-15 ~ 2023-08-31")
+
+    report = f"""# PatchTST Experiment Report
+
+> 실험 결과 중 **Test MAE 기준 best** 기록 (run: `{run_name}`, Best Epoch {best_epoch})
+
+## Dataset
+- 사용 데이터 : {data_text}
+- 데이터 기간 : {period}
+- 차량 수 : {metrics.get('num_vehicles', len(vehicle_ids))}
+- Feature : {feature_text}
+- Target : {metrics.get('target_col', 'soh')}
+
+## Environment
+- Python : {env_info.get('python', '-')}
+- PyTorch : {env_info.get('pytorch', '-')}
+- CUDA : {env_info.get('cuda', '-')}
+- GPU : {env_info.get('gpu', metrics.get('device', '-'))}
+
+## Hyperparameters
+
+| Parameter | Value |
+|-----------|------|
+| seq_len | {metrics.get('seq_len', '')} |
+| pred_len | {metrics.get('pred_len', 1)} |
+| patch_len | {metrics.get('patch_len', '')} |
+| stride | {metrics.get('stride', '')} |
+| sample_stride | {metrics.get('sample_stride', '')} |
+| window_stride | {metrics.get('window_stride', '')} |
+| batch_size | {metrics.get('batch_size', '')} |
+| learning_rate | {metrics.get('learning_rate', '')} |
+| epochs | {metrics.get('epochs', '')} |
+| best_epoch | {best_epoch} |
+
+## Result
+
+> Validation loss 기준 **Best Epoch = {best_epoch}** (val_loss={best_val:.6f}) 체크포인트로 Test 평가.
+
+| Metric | Value |
+|---------|------|
+| MAE | {mae:.6f} |
+| MSE | {mse:.6f} |
+| RMSE | {rmse:.6f} |
+| Best Val Loss (scaled MSE) | {best_val:.6f} |
+
+### Epoch별 Loss
+
+| Epoch | train_loss | val_loss |
+|------:|----------:|---------:|
+{chr(10).join(epoch_rows)}
+
+### 차량별 Test 성능
+
+| 차량 ID | MAE | RMSE | n |
+|---------|----:|-----:|--:|
+{chr(10).join(vehicle_rows) if vehicle_rows else '| - | - | - | - |'}
+
+## Graphs
+
+### Training / Validation Loss
+![training_loss]({img_prefix}training_loss.png)
+
+### SOH Prediction (Actual vs Predicted)
+![prediction]({img_prefix}prediction.png)
+
+## Observation
+
+### 좋았던 점
+- Best validation epoch 체크포인트로 Test를 평가해, 마지막 epoch 과적합 영향을 줄였.
+- 차량별 MAE/RMSE를 함께 기록해 성능 편차를 확인할 수 있음.
+
+### 아쉬웠던 점
+- 차량 간 성능 편차가 큼 (일부 차량에서 예측이 평탄화되거나 bias가 큼).
+- Validation loss가 epoch마다 흔들려 학습이 불안정한 구간이 있음.
+
+### 다음 실험
+- Early stopping / learning rate scheduler 적용
+- 차량별 bias 보정 또는 성능이 낮은 차량 feature 재검토
+- pred_len / seq_len / patch 설정 비교 실험
+"""
+
+    os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    return report_path
+
+
+
+def collect_env_info(device: torch.device) -> dict:
+    import sys
+
+    gpu_name = "-"
+    if device.type == "cuda" and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+    return {
+        "python": sys.version.split()[0],
+        "pytorch": torch.__version__,
+        "cuda": torch.version.cuda or "-",
+        "gpu": gpu_name,
+    }
+
+
 def save_artifacts(
     out_dir: str,
     train_losses: List[float],
@@ -510,6 +684,7 @@ def save_artifacts(
     device_nos: List[str],
     time_indices: List[int],
     metrics: dict,
+    env_info: dict | None = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
@@ -559,6 +734,16 @@ def save_artifacts(
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "prediction.png"), dpi=140)
     plt.close()
+
+    report_path = write_experiment_report(
+        out_dir=out_dir,
+        metrics=metrics,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        env_info=env_info,
+    )
+    if report_path:
+        print(f"[DONE] experiment report: {report_path}")
 
 
 def build_checkpoint(
@@ -793,9 +978,11 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_val = float("inf")
+    best_epoch = 0
     train_losses: List[float] = []
     val_losses: List[float] = []
     best_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+    env_info = collect_env_info(device)
 
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -805,6 +992,7 @@ def main():
 
         if va_loss < best_val:
             best_val = va_loss
+            best_epoch = epoch
             torch.save(
                 build_checkpoint(
                     model=model,
@@ -839,7 +1027,8 @@ def main():
     )
 
     mae = float(mean_absolute_error(true, pred))
-    rmse = float(math.sqrt(mean_squared_error(true, pred)))
+    mse = float(mean_squared_error(true, pred))
+    rmse = float(math.sqrt(mse))
 
     metrics = {
         "device": str(device),
@@ -849,6 +1038,7 @@ def main():
         "target_col": data.target_col,
         "feature_cols": data.feature_cols,
         "seq_len": args.seq_len,
+        "pred_len": 1,
         "patch_len": args.patch_len,
         "stride": args.stride,
         "sample_stride": args.sample_stride,
@@ -857,13 +1047,21 @@ def main():
         "epochs": args.epochs,
         "num_workers": args.num_workers,
         "learning_rate": args.lr,
+        "best_epoch": best_epoch,
         "best_val_loss": best_val,
         "test_loss_scaled_mse": test_loss,
         "test_mae": mae,
+        "test_mse": mse,
         "test_rmse": rmse,
         "overall_mae": mae,
         "overall_rmse": rmse,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
         "vehicles": vehicle_metrics,
+        "python": env_info.get("python"),
+        "pytorch": env_info.get("pytorch"),
+        "cuda": env_info.get("cuda"),
+        "gpu": env_info.get("gpu"),
     }
 
     save_artifacts(
@@ -875,9 +1073,12 @@ def main():
         device_nos=device_nos,
         time_indices=time_indices,
         metrics=metrics,
+        env_info=env_info,
     )
 
+    print(f"[DONE] Best Epoch: {best_epoch} (val_loss={best_val:.6f})")
     print(f"[DONE] Test MAE:  {mae:.6f}")
+    print(f"[DONE] Test MSE:  {mse:.6f}")
     print(f"[DONE] Test RMSE: {rmse:.6f}")
     for vid, vm in vehicle_metrics.items():
         print(f"[DONE]   {vid}: MAE={vm['mae']:.6f} RMSE={vm['rmse']:.6f}")
