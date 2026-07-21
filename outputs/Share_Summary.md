@@ -37,6 +37,83 @@
 
 ---
 
+## 학습 방법 (`train.py`)
+
+엔트리포인트: `python train.py` (`data/` CSV 4대, 예측 타깃 `soh`)
+
+### 1) 데이터 → 윈도우
+
+| 단계 | 내용 |
+|------|------|
+| 입력 | `data/*.csv.gz` 4대 (178, 211, 220, 226) |
+| Feature | SOC·전압·전류·온도·셀전압·주행거리 등 20개 (기본값) |
+| 다운샘플 | `sample_stride=10` (10행마다 1행) |
+| 시계열 분할 | 차량별 **시간순** train 70% / val 15% / test 15% |
+| 윈도우 | `seq_len=96`, `window_stride=8` 슬라이딩 (차량 경계 안 넘김) |
+| 정규화 | global `StandardScaler` (기본) 또는 `--per_vehicle_norm` (차량별 scaler) |
+
+### 2) 모델 & 학습 루프
+
+- **모델**: `PatchTSTRegressor` — patch_len=16, stride=8, d_model=128, 3 layers, 8 heads
+- **손실**: MSE (기본), AdamW lr=1e-3, batch=128
+- **스케줄**: `ReduceLROnPlateau` (val_loss 2 epoch 미개선 시 LR×0.5)
+- **체크포인트**: val_loss 최저 epoch → `checkpoints/*/best_model.pt`
+- **실험 공통**: epochs=8, dropout=0.1 (`run2_fast` 기준)
+
+```bash
+# Baseline (run2_fast)
+python train.py --data_dir data --epochs 8 \
+  --output_dir outputs/run2_fast --checkpoint_dir checkpoints/run2_fast
+```
+
+### 3) 예측 후처리 (known-vehicle best)
+
+`run7b_norm_bias` (MAE 0.65)는 **학습 없이** 기존 체크포인트 + 후처리만 적용:
+
+```bash
+python train.py --eval_checkpoint checkpoints/run7_vehicle_norm/best_model.pt \
+  --per_vehicle_norm --vehicle_bias_correct \
+  --output_dir outputs/run7b_norm_bias
+```
+
+| 옵션 | 역할 |
+|------|------|
+| `--per_vehicle_norm` | 차량별 train split으로 feature/target scaler 따로 fit |
+| `--vehicle_bias_correct` | val에서 차량별 bias(예측−실제 평균) 추정 → test 예측에서 차감 |
+
+### 4) 새 차량 (LOVO) & 캘리브레이션
+
+| 실험 | train.py 핵심 옵션 | 설명 |
+|------|-------------------|------|
+| `lovo_holdout_220` | `--holdout_vehicle 220` | 220을 train/val에서 제외, test만 평가. bias 보정 **끔** (zero-shot) |
+| `calib_220_testh_f5` | `--holdout_vehicle 220 --calibrate_frac 0.05 --eval_checkpoint ...` | 220 test **앞 5%**로 bias 추정, 나머지 95% 평가. fine-tune 없음 |
+
+```bash
+# LOVO zero-shot
+python train.py --holdout_vehicle 220 --epochs 8 \
+  --no-vehicle_bias_correct \
+  --output_dir outputs/lovo_holdout_220
+
+# Test 5% bias 캘리브 (학습 생략, 기존 LOVO 체크포인트 사용)
+python train.py --holdout_vehicle 220 --calibrate_frac 0.05 \
+  --eval_checkpoint checkpoints/lovo_holdout_220/best_model.pt \
+  --output_dir outputs/calib_220_testh_f5
+```
+
+> LOVO + `calibrate_frac`일 때 bias는 val이 아니라 **캘리브 구간**에서 추정. `finetune_epochs>0`이면 캘리브 구간으로 추가 fine-tune 가능.
+
+### 5) 파이프라인 한눈에
+
+```text
+CSV(4대) → 시간분할(7:1.5:1.5) → StandardScaler → 슬라이딩윈도우(96)
+    → PatchTST 학습(MSE, AdamW) → best checkpoint
+    → [선택] per-vehicle norm
+    → [선택] val/calib bias 보정
+    → test MAE 평가 + prediction.png 저장
+```
+
+---
+
 ## 보여줄 그래프
 
 ### 1) Known-vehicle (잘 되는 경우)
