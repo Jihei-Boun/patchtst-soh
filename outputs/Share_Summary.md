@@ -46,11 +46,39 @@
 | 단계 | 내용 |
 |------|------|
 | 입력 | `data/*.csv.gz` 4대 (178, 211, 220, 226) |
-| Feature | SOC·전압·전류·온도·셀전압·주행거리 등 20개 (기본값) |
+| Feature | 아래 **20개** (기본값, `--feature_cols` 미지정 시) |
+| 예측 타깃 | `soh` |
 | 다운샘플 | `sample_stride=10` (10행마다 1행) |
 | 시계열 분할 | 차량별 **시간순** train 70% / val 15% / test 15% |
 | 윈도우 | `seq_len=96`, `window_stride=8` 슬라이딩 (차량 경계 안 넘김) |
 | 정규화 | global `StandardScaler` (기본) 또는 `--per_vehicle_norm` (차량별 scaler) |
+
+**입력 feature 20개** (`utils.DEFAULT_FEATURE_COLS`, 예측 타깃 `soh` 제외):
+
+| # | 컬럼명 | 설명 |
+|---|--------|------|
+| 1 | `soc` | 충전 상태 (State of Charge) |
+| 2 | `socd` | SOC 변화율 |
+| 3 | `pack_volt` | 팩 전압 |
+| 4 | `pack_current` | 팩 전류 |
+| 5 | `batt_pw` | 배터리 출력 |
+| 6 | `mod_avg_temp` | 모듈 평균 온도 |
+| 7 | `mod_max_temp` | 모듈 최대 온도 |
+| 8 | `mod_min_temp` | 모듈 최소 온도 |
+| 9 | `batt_internal_temp` | 배터리 내부 온도 |
+| 10 | `ext_temp` | 외부 온도 |
+| 11 | `int_temp` | 실내 온도 |
+| 12 | `cell_volt_dispersion` | 셀 전압 편차 |
+| 13 | `max_cell_volt` | 최대 셀 전압 |
+| 14 | `min_cell_volt` | 최소 셀 전압 |
+| 15 | `odometer` | 주행거리 |
+| 16 | `chrg_cnt` | 충전 횟수 |
+| 17 | `cumul_energy_chrgd` | 누적 충전 에너지 |
+| 18 | `cumul_pw_chrgd` | 누적 충전 전력 |
+| 19 | `insul_resistance` | 절연 저항 |
+| 20 | `sub_batt_volt` | 보조 배터리 전압 |
+
+> 결측 20% 초과 컬럼은 자동 제외. 178호는 `int_temp`/`ext_temp`가 0 고정 → `--fix_zero_temp` 시 `mod_avg_temp` 등으로 대체.
 
 ### 2) 모델 & 학습 루프
 
