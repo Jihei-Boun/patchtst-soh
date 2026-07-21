@@ -39,10 +39,10 @@ data/*
 checkpoints/*
 !checkpoints/.gitkeep
 
-# --- 학습 산출물 (대용량 CSV/이미지/로그) ---
-# REPORT.md, metrics.json 은 실험 요약용으로 커밋 허용
+# --- 학습 산출물 ---
+# REPORT.md, metrics.json, *.png(그래프) 는 커밋 허용
+# prediction.csv 등 대용량/재생성 가능 파일만 제외
 outputs/**/prediction.csv
-outputs/**/*.png
 outputs/**/*.log
 outputs/**/*.pt
 outputs/**/*.pth
