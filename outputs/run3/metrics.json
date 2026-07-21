@@ -1,0 +1,80 @@
+{
+  "device": "cuda",
+  "data_paths": [
+    "data/01241225178.csv.gz",
+    "data/01241225211.csv.gz",
+    "data/01241225220.csv.gz",
+    "data/01241225226.csv.gz"
+  ],
+  "num_vehicles": 4,
+  "vehicle_ids": [
+    "01241225178",
+    "01241225211",
+    "01241225220",
+    "01241225226"
+  ],
+  "target_col": "soh",
+  "feature_cols": [
+    "soc",
+    "socd",
+    "pack_volt",
+    "pack_current",
+    "batt_pw",
+    "mod_avg_temp",
+    "mod_max_temp",
+    "mod_min_temp",
+    "batt_internal_temp",
+    "ext_temp",
+    "int_temp",
+    "cell_volt_dispersion",
+    "max_cell_volt",
+    "min_cell_volt",
+    "odometer",
+    "chrg_cnt",
+    "cumul_energy_chrgd",
+    "cumul_pw_chrgd",
+    "insul_resistance",
+    "sub_batt_volt"
+  ],
+  "seq_len": 96,
+  "patch_len": 16,
+  "stride": 8,
+  "sample_stride": 10,
+  "window_stride": 8,
+  "batch_size": 128,
+  "epochs": 8,
+  "num_workers": 4,
+  "learning_rate": 0.001,
+  "best_val_loss": 0.16844669385744934,
+  "test_loss_scaled_mse": 0.3793168282280278,
+  "test_mae": 1.0362489223480225,
+  "test_rmse": 1.2358297636238207,
+  "overall_mae": 1.0362489223480225,
+  "overall_rmse": 1.2358297636238207,
+  "vehicles": {
+    "01241225178": {
+      "mae": 1.1006799936294556,
+      "rmse": 1.1734260975046242,
+      "n": 20157,
+      "test_loss_scaled_mse": 0.39853573579464957
+    },
+    "01241225211": {
+      "mae": 0.3587975800037384,
+      "rmse": 0.38857733952222273,
+      "n": 34241,
+      "test_loss_scaled_mse": 0.04378443882703336
+    },
+    "01241225220": {
+      "mae": 1.7711657285690308,
+      "rmse": 1.7968322748826777,
+      "n": 31381,
+      "test_loss_scaled_mse": 0.9375623090238105
+    },
+    "01241225226": {
+      "mae": 0.6559242010116577,
+      "rmse": 0.6864598598858807,
+      "n": 3062,
+      "test_loss_scaled_mse": 0.1373848292666177
+    }
+  }
+}

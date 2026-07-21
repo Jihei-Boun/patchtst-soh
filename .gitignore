@@ -1,0 +1,56 @@
+# --- Python / 환경 ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- 비밀/로컬 설정 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- 원본 데이터 (용량 큼 + VIN 등 민감 텔레메트리) ---
+# 학습 데이터는 로컬/사내 스토리지에 두고, 코드만 공유합니다.
+data/*
+!data/.gitkeep
+!data/README.md
+
+# --- 모델 체크포인트 (재학습으로 재생성 가능) ---
+checkpoints/*
+!checkpoints/.gitkeep
+
+# --- 학습 산출물 (대용량 CSV/이미지/로그) ---
+# REPORT.md, metrics.json 은 실험 요약용으로 커밋 허용
+outputs/**/prediction.csv
+outputs/**/*.png
+outputs/**/*.log
+outputs/**/*.pt
+outputs/**/*.pth
+outputs/**/*.ckpt
+outputs/**/*.npy
+outputs/**/*.npz
+outputs/**/*.h5
+
+# 루트에 남는 임시 로그
+*.log
+train.log
