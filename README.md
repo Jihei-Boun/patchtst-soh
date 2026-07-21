@@ -25,6 +25,8 @@ python train.py \
 
 GPU(CUDA)가 있으면 자동으로 사용합니다.
 
+배포(알려진 차 / 새 차 캘리브레이션) 규칙은 [`DEPLOYMENT.md`](DEPLOYMENT.md)를 참고하세요.
+
 ## 프로젝트 구조
 
 ```text

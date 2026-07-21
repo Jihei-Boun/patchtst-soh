@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -168,10 +169,14 @@ class SlidingWindowDataset(Dataset):
         seq_len: int,
         pred_len: int = 1,
         window_stride: int = 1,
+        vehicle_idx: int = 0,
+        return_vehicle_idx: bool = False,
     ) -> None:
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.window_stride = max(1, int(window_stride))
+        self.vehicle_idx = int(vehicle_idx)
+        self.return_vehicle_idx = return_vehicle_idx
         max_start = len(x) - seq_len - pred_len + 1
         if max_start <= 0:
             raise ValueError(
@@ -185,10 +190,12 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.starts)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         s = int(self.starts[idx])
         e = s + self.seq_len
         y_idx = e + self.pred_len - 1
+        if self.return_vehicle_idx:
+            return self.x[s:e], self.y[y_idx], self.vehicle_idx
         return self.x[s:e], self.y[y_idx]
 
 
@@ -221,6 +228,8 @@ class PatchTSTRegressor(nn.Module):
         num_layers: int = 3,
         ff_dim: int = 256,
         dropout: float = 0.1,
+        num_vehicles: int = 0,
+        vehicle_emb_dim: int = 16,
     ):
         super().__init__()
         self.embed = PatchEmbedding(num_features, patch_len, stride, d_model)
@@ -238,19 +247,36 @@ class PatchTSTRegressor(nn.Module):
             activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # num_vehicles>0 이면 index0=unknown, 1..N=학습 차량
+        self.num_vehicles = int(num_vehicles)
+        self.vehicle_emb_dim = int(vehicle_emb_dim) if num_vehicles > 0 else 0
+        self.vehicle_emb: nn.Embedding | None = None
+        head_in = d_model
+        if self.num_vehicles > 0:
+            self.vehicle_emb = nn.Embedding(self.num_vehicles + 1, self.vehicle_emb_dim)
+            nn.init.normal_(self.vehicle_emb.weight, mean=0.0, std=0.02)
+            head_in = d_model + self.vehicle_emb_dim
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, vehicle_idx: torch.Tensor | None = None
+    ) -> torch.Tensor:
         z = self.embed(x)
         z = z + self.pos_embed[:, : z.size(1), :]
         z = self.encoder(z)
         z = z[:, -1, :]
+        if self.vehicle_emb is not None:
+            if vehicle_idx is None:
+                vehicle_idx = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            else:
+                vehicle_idx = vehicle_idx.long().to(x.device)
+            z = torch.cat([z, self.vehicle_emb(vehicle_idx)], dim=-1)
         out = self.head(z).squeeze(-1)
         return out
 
@@ -273,6 +299,18 @@ class DataBundle:
     test_segments: List[Tuple[np.ndarray, np.ndarray]]
     vehicle_ids: List[str]
     data_paths: List[str]
+    per_vehicle_norm: bool = False
+    feature_scalers: dict | None = None  # vehicle_id -> StandardScaler
+    target_scalers: dict | None = None
+    train_vehicle_ids: List[str] | None = None
+    val_vehicle_ids: List[str] | None = None
+    test_vehicle_ids: List[str] | None = None
+    holdout_vehicle: str = ""
+    vehicle_to_idx: dict | None = None  # embedding용 (unknown=0)
+    calib_segments: List[Tuple[np.ndarray, np.ndarray]] | None = None
+    calib_vehicle_ids: List[str] | None = None
+    calibrate_frac: float = 0.0
+    fix_zero_temp: bool = False
 
 
 def resolve_data_paths(data_path: str = "", data_dir: str = "") -> List[str]:
@@ -296,12 +334,48 @@ def resolve_data_paths(data_path: str = "", data_dir: str = "") -> List[str]:
     return paths
 
 
+def fix_zero_temp_features(
+    work: pd.DataFrame, feature_cols: List[str]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    int_temp/ext_temp가 거의 0 또는 상수면(178 등) mod_avg_temp 등으로 대체.
+    proxy도 없으면 해당 feature를 제거합니다.
+    """
+    proxies = ["mod_avg_temp", "batt_internal_temp", "mod_min_temp", "mod_max_temp"]
+    kept = list(feature_cols)
+    for col in ("int_temp", "ext_temp"):
+        if col not in work.columns or col not in kept:
+            continue
+        vals = pd.to_numeric(work[col], errors="coerce").to_numpy(dtype=float)
+        zero_ratio = float(np.nanmean(np.abs(vals) < 1e-6)) if len(vals) else 1.0
+        std = float(np.nanstd(vals)) if len(vals) else 0.0
+        if zero_ratio < 0.9 and std > 1e-6:
+            continue
+        proxy = next(
+            (
+                p
+                for p in proxies
+                if p in work.columns and float(pd.to_numeric(work[p], errors="coerce").std()) > 1e-6
+            ),
+            None,
+        )
+        if proxy:
+            work[col] = pd.to_numeric(work[proxy], errors="coerce")
+            print(f"[WARN]   {col} zero/constant → filled from {proxy}")
+        else:
+            kept = [c for c in kept if c != col]
+            work = work.drop(columns=[col], errors="ignore")
+            print(f"[WARN]   {col} zero/constant → dropped (no proxy)")
+    return work, kept
+
+
 def prepare_one_vehicle_df(
     csv_path: str,
     target_col: str,
     time_col: str,
     feature_cols: List[str] | None,
     sample_stride: int = 1,
+    fix_zero_temp: bool = False,
 ) -> Tuple[pd.DataFrame, List[str], str]:
     df = read_vehicle_csv(csv_path)
     if df.empty:
@@ -324,6 +398,9 @@ def prepare_one_vehicle_df(
     for col in use_cols:
         work[col] = pd.to_numeric(work[col], errors="coerce")
 
+    if fix_zero_temp:
+        work, f_cols = fix_zero_temp_features(work, f_cols)
+
     f_cols = filter_usable_features(work, f_cols, max_missing=0.2)
     use_cols = f_cols + [t_col]
     work = work[use_cols].replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
@@ -338,6 +415,17 @@ def prepare_one_vehicle_df(
     return work, f_cols, t_col
 
 
+def resolve_holdout_id(vehicle_ids: List[str], holdout: str) -> str:
+    """holdout 문자열을 실제 vehicle_id로 매칭 (전체 ID 또는 끝 3~자리)."""
+    q = holdout.strip()
+    if not q:
+        return ""
+    for vid in vehicle_ids:
+        if vid == q or vid.endswith(q):
+            return vid
+    raise ValueError(f"holdout_vehicle '{holdout}' 을(를) 찾지 못함. 후보: {vehicle_ids}")
+
+
 def load_and_prepare_data(
     data_paths: List[str],
     seq_len: int,
@@ -345,6 +433,10 @@ def load_and_prepare_data(
     time_col: str = "",
     feature_cols: List[str] | None = None,
     sample_stride: int = 1,
+    per_vehicle_norm: bool = False,
+    holdout_vehicle: str = "",
+    calibrate_frac: float = 0.0,
+    fix_zero_temp: bool = False,
 ) -> DataBundle:
     prepared = []
     shared_features: List[str] | None = None
@@ -352,12 +444,16 @@ def load_and_prepare_data(
 
     for path in data_paths:
         work, f_cols, t_col = prepare_one_vehicle_df(
-            path, target_col, time_col, feature_cols, sample_stride=sample_stride
+            path,
+            target_col,
+            time_col,
+            feature_cols,
+            sample_stride=sample_stride,
+            fix_zero_temp=fix_zero_temp,
         )
         if shared_features is None:
             shared_features = f_cols
         else:
-            # 여러 차량에서 공통 feature만 사용
             shared_features = [c for c in shared_features if c in f_cols]
         prepared.append((path, work))
 
@@ -365,12 +461,12 @@ def load_and_prepare_data(
         raise ValueError("차량들 간 공통 feature가 없습니다.")
 
     print(f"[INFO] common features ({len(shared_features)}): {shared_features}")
+    print(f"[INFO] per_vehicle_norm: {per_vehicle_norm}")
 
-    train_x_list, train_y_list = [], []
-    val_x_list, val_y_list = [], []
-    test_x_list, test_y_list = [], []
-    train_segments, val_segments, test_segments = [], [], []
-    vehicle_ids: List[str] = []
+    all_vids: List[str] = []
+    all_x_tr, all_y_tr = [], []
+    all_x_va, all_y_va = [], []
+    all_x_te, all_y_te = [], []
 
     for path, work in prepared:
         if len(work) < seq_len + 10:
@@ -384,16 +480,45 @@ def load_and_prepare_data(
         if min(len(x_tr), len(x_va), len(x_te)) <= seq_len:
             print(f"[WARN] skip short split: {path}")
             continue
-        vehicle_ids.append(vehicle_id_from_path(path))
-        train_x_list.append(x_tr)
-        train_y_list.append(y_tr)
-        val_x_list.append(x_va)
-        val_y_list.append(y_va)
-        test_x_list.append(x_te)
-        test_y_list.append(y_te)
+        all_vids.append(vehicle_id_from_path(path))
+        all_x_tr.append(x_tr)
+        all_y_tr.append(y_tr)
+        all_x_va.append(x_va)
+        all_y_va.append(y_va)
+        all_x_te.append(x_te)
+        all_y_te.append(y_te)
 
-    if not train_x_list:
+    if not all_vids:
         raise ValueError("학습에 사용할 차량 데이터가 없습니다.")
+
+    holdout_id = resolve_holdout_id(all_vids, holdout_vehicle) if holdout_vehicle else ""
+    if holdout_id:
+        print(f"[INFO] LOVO holdout vehicle: {holdout_id}")
+        if per_vehicle_norm:
+            print("[WARN] LOVO에서는 per_vehicle_norm을 끄고 global scaler를 사용합니다.")
+            per_vehicle_norm = False
+
+    seen_idx = [i for i, v in enumerate(all_vids) if v != holdout_id]
+    hold_idx = [i for i, v in enumerate(all_vids) if v == holdout_id]
+    if holdout_id and not hold_idx:
+        raise ValueError(f"holdout 차량 데이터가 없습니다: {holdout_id}")
+    if holdout_id and not seen_idx:
+        raise ValueError("holdout 제외 후 학습 차량이 없습니다.")
+
+    train_idx = seen_idx if holdout_id else list(range(len(all_vids)))
+    val_idx = train_idx
+    test_idx = hold_idx if holdout_id else list(range(len(all_vids)))
+
+    train_vehicle_ids = [all_vids[i] for i in train_idx]
+    val_vehicle_ids = [all_vids[i] for i in val_idx]
+    test_vehicle_ids = [all_vids[i] for i in test_idx]
+
+    train_x_list = [all_x_tr[i] for i in train_idx]
+    train_y_list = [all_y_tr[i] for i in train_idx]
+    val_x_list = [all_x_va[i] for i in val_idx]
+    val_y_list = [all_y_va[i] for i in val_idx]
+    test_x_list = [all_x_te[i] for i in test_idx]
+    test_y_list = [all_y_te[i] for i in test_idx]
 
     x_train = np.concatenate(train_x_list, axis=0)
     y_train = np.concatenate(train_y_list, axis=0)
@@ -402,46 +527,133 @@ def load_and_prepare_data(
     x_test = np.concatenate(test_x_list, axis=0)
     y_test = np.concatenate(test_y_list, axis=0)
 
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-    x_scaler.fit(x_train)
-    y_scaler.fit(y_train)
+    train_segments: List[Tuple[np.ndarray, np.ndarray]] = []
+    val_segments: List[Tuple[np.ndarray, np.ndarray]] = []
+    test_segments: List[Tuple[np.ndarray, np.ndarray]] = []
+    feature_scalers: dict | None = None
+    target_scalers: dict | None = None
 
-    for x_tr, y_tr in zip(train_x_list, train_y_list):
-        train_segments.append(
-            (
-                x_scaler.transform(x_tr),
-                y_scaler.transform(y_tr).reshape(-1),
+    if per_vehicle_norm:
+        feature_scalers = {}
+        target_scalers = {}
+        for vid, x_tr, y_tr, x_va, y_va in zip(
+            train_vehicle_ids, train_x_list, train_y_list, val_x_list, val_y_list
+        ):
+            x_sc = StandardScaler().fit(x_tr)
+            y_sc = StandardScaler().fit(y_tr)
+            feature_scalers[vid] = x_sc
+            target_scalers[vid] = y_sc
+            train_segments.append(
+                (x_sc.transform(x_tr), y_sc.transform(y_tr).reshape(-1))
             )
-        )
-    for x_va, y_va in zip(val_x_list, val_y_list):
-        val_segments.append(
-            (
-                x_scaler.transform(x_va),
-                y_scaler.transform(y_va).reshape(-1),
+            val_segments.append(
+                (x_sc.transform(x_va), y_sc.transform(y_va).reshape(-1))
             )
-        )
-    for x_te, y_te in zip(test_x_list, test_y_list):
-        test_segments.append(
-            (
-                x_scaler.transform(x_te),
-                y_scaler.transform(y_te).reshape(-1),
+            print(
+                f"[NORM] {vid}: y_mean={float(y_sc.mean_[0]):.3f} "
+                f"y_scale={float(y_sc.scale_[0]):.3f}"
             )
+        for vid, x_te, y_te in zip(test_vehicle_ids, test_x_list, test_y_list):
+            x_sc = feature_scalers[vid]
+            y_sc = target_scalers[vid]
+            test_segments.append(
+                (x_sc.transform(x_te), y_sc.transform(y_te).reshape(-1))
+            )
+        x_scaler = StandardScaler().fit(x_train)
+        y_scaler = StandardScaler().fit(y_train)
+        x_train_sc = np.concatenate([s[0] for s in train_segments], axis=0)
+        y_train_sc = np.concatenate([s[1] for s in train_segments], axis=0)
+        x_val_sc = np.concatenate([s[0] for s in val_segments], axis=0)
+        y_val_sc = np.concatenate([s[1] for s in val_segments], axis=0)
+        x_test_sc = np.concatenate([s[0] for s in test_segments], axis=0)
+        y_test_sc = np.concatenate([s[1] for s in test_segments], axis=0)
+    else:
+        x_scaler = StandardScaler().fit(x_train)
+        y_scaler = StandardScaler().fit(y_train)
+        for x_tr, y_tr in zip(train_x_list, train_y_list):
+            train_segments.append(
+                (x_scaler.transform(x_tr), y_scaler.transform(y_tr).reshape(-1))
+            )
+        for x_va, y_va in zip(val_x_list, val_y_list):
+            val_segments.append(
+                (x_scaler.transform(x_va), y_scaler.transform(y_va).reshape(-1))
+            )
+        for x_te, y_te in zip(test_x_list, test_y_list):
+            test_segments.append(
+                (x_scaler.transform(x_te), y_scaler.transform(y_te).reshape(-1))
+            )
+        x_train_sc = x_scaler.transform(x_train)
+        y_train_sc = y_scaler.transform(y_train).reshape(-1)
+        x_val_sc = x_scaler.transform(x_val)
+        y_val_sc = y_scaler.transform(y_val).reshape(-1)
+        x_test_sc = x_scaler.transform(x_test)
+        y_test_sc = y_scaler.transform(y_test).reshape(-1)
+
+    # embedding: unknown=0, 학습 차량=1..N
+    uniq_train = list(dict.fromkeys(train_vehicle_ids))
+    vehicle_to_idx = {vid: i + 1 for i, vid in enumerate(uniq_train)}
+
+    calib_segments: List[Tuple[np.ndarray, np.ndarray]] | None = None
+    calib_vehicle_ids: List[str] | None = None
+    cal_frac = float(calibrate_frac or 0.0)
+
+    if holdout_id and cal_frac > 0:
+        if per_vehicle_norm:
+            raise ValueError("holdout + calibrate_frac 에서는 per_vehicle_norm을 사용할 수 없습니다.")
+        if not (0.0 < cal_frac < 0.9):
+            raise ValueError(f"calibrate_frac는 (0, 0.9) 범위여야 합니다: {cal_frac}")
+        hi = hold_idx[0]
+        # LOVO test(마지막 15%)와 동일 구간에서 few-shot:
+        # 앞 calibrate_frac → calib, 나머지 → eval (zero-shot과 비교 가능)
+        x_te_raw, y_te_raw = all_x_te[hi], all_y_te[hi]
+        n = len(x_te_raw)
+        min_cal = seq_len + 20
+        min_eval = seq_len + 20
+        n_cal = max(min_cal, int(n * cal_frac))
+        if n_cal > n - min_eval:
+            n_cal = n - min_eval
+        if n_cal < min_cal:
+            raise ValueError(
+                f"holdout test가 calibrate에 너무 짧습니다: n={n}, n_cal={n_cal}"
+            )
+        x_cal_raw, y_cal_raw = x_te_raw[:n_cal], y_te_raw[:n_cal]
+        x_ev_raw, y_ev_raw = x_te_raw[n_cal:], y_te_raw[n_cal:]
+        calib_segments = [
+            (
+                x_scaler.transform(x_cal_raw),
+                y_scaler.transform(y_cal_raw).reshape(-1),
+            )
+        ]
+        test_segments = [
+            (
+                x_scaler.transform(x_ev_raw),
+                y_scaler.transform(y_ev_raw).reshape(-1),
+            )
+        ]
+        x_test_sc = test_segments[0][0]
+        y_test_sc = test_segments[0][1]
+        calib_vehicle_ids = [holdout_id]
+        test_vehicle_ids = [holdout_id]
+        print(
+            f"[INFO] few-shot calib on holdout TEST head: frac={cal_frac:.2f} → "
+            f"calib_rows={n_cal}/{n} ({100.0 * n_cal / n:.1f}% of test), "
+            f"eval_rows={n - n_cal} "
+            f"(LOVO zero-shot은 test 전체 n={n})"
         )
 
     print(
-        f"[INFO] vehicles used: {len(train_segments)} | "
-        f"ids: {vehicle_ids} | "
-        f"train/val/test rows: {len(x_train)}/{len(x_val)}/{len(x_test)}"
+        f"[INFO] train vehicles: {train_vehicle_ids} | "
+        f"test vehicles: {test_vehicle_ids} | "
+        f"train/val/test rows: {len(x_train)}/{len(x_val)}/{len(x_test_sc)}"
     )
 
     return DataBundle(
-        x_train=x_scaler.transform(x_train),
-        y_train=y_scaler.transform(y_train).reshape(-1),
-        x_val=x_scaler.transform(x_val),
-        y_val=y_scaler.transform(y_val).reshape(-1),
-        x_test=x_scaler.transform(x_test),
-        y_test=y_scaler.transform(y_test).reshape(-1),
+        x_train=x_train_sc,
+        y_train=y_train_sc,
+        x_val=x_val_sc,
+        y_val=y_val_sc,
+        x_test=x_test_sc,
+        y_test=y_test_sc,
         feature_scaler=x_scaler,
         target_scaler=y_scaler,
         feature_cols=shared_features,
@@ -449,8 +661,20 @@ def load_and_prepare_data(
         train_segments=train_segments,
         val_segments=val_segments,
         test_segments=test_segments,
-        vehicle_ids=vehicle_ids,
+        vehicle_ids=test_vehicle_ids,
         data_paths=data_paths,
+        per_vehicle_norm=per_vehicle_norm,
+        feature_scalers=feature_scalers,
+        target_scalers=target_scalers,
+        train_vehicle_ids=train_vehicle_ids,
+        val_vehicle_ids=val_vehicle_ids,
+        test_vehicle_ids=test_vehicle_ids,
+        holdout_vehicle=holdout_id,
+        vehicle_to_idx=vehicle_to_idx,
+        calib_segments=calib_segments,
+        calib_vehicle_ids=calib_vehicle_ids,
+        calibrate_frac=cal_frac if holdout_id else 0.0,
+        fix_zero_temp=fix_zero_temp,
     )
 
 
@@ -458,26 +682,51 @@ def build_concat_dataset(
     segments: List[Tuple[np.ndarray, np.ndarray]],
     seq_len: int,
     window_stride: int = 1,
+    vehicle_ids: List[str] | None = None,
+    vehicle_to_idx: dict | None = None,
+    use_vehicle_idx: bool = False,
 ) -> Dataset:
-    datasets = [
-        SlidingWindowDataset(
-            x, y, seq_len=seq_len, pred_len=1, window_stride=window_stride
+    datasets = []
+    for i, (x, y) in enumerate(segments):
+        vid = (vehicle_ids or [""])[i] if vehicle_ids else ""
+        vidx = 0
+        if use_vehicle_idx and vehicle_to_idx is not None:
+            vidx = int(vehicle_to_idx.get(vid, 0))
+        datasets.append(
+            SlidingWindowDataset(
+                x,
+                y,
+                seq_len=seq_len,
+                pred_len=1,
+                window_stride=window_stride,
+                vehicle_idx=vidx,
+                return_vehicle_idx=use_vehicle_idx,
+            )
         )
-        for x, y in segments
-    ]
     if len(datasets) == 1:
         return datasets[0]
     return ConcatDataset(datasets)
 
 
+def _unpack_batch(batch, device):
+    if len(batch) == 3:
+        xb, yb, vid = batch
+        return (
+            xb.to(device, non_blocking=True),
+            yb.to(device, non_blocking=True),
+            vid.to(device, non_blocking=True),
+        )
+    xb, yb = batch
+    return xb.to(device, non_blocking=True), yb.to(device, non_blocking=True), None
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     model.train()
     losses = []
-    for xb, yb in loader:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
+    for batch in loader:
+        xb, yb, vid = _unpack_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(xb)
+        pred = model(xb, vid) if vid is not None else model(xb)
         loss = criterion(pred, yb)
         loss.backward()
         optimizer.step()
@@ -490,15 +739,29 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, np.ndarray, np.nd
     model.eval()
     losses = []
     preds, trues = [], []
-    for xb, yb in loader:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        pred = model(xb)
+    for batch in loader:
+        xb, yb, vid = _unpack_batch(batch, device)
+        pred = model(xb, vid) if vid is not None else model(xb)
         loss = criterion(pred, yb)
         losses.append(loss.item())
         preds.append(pred.detach().cpu().numpy())
         trues.append(yb.detach().cpu().numpy())
     return float(np.mean(losses)), np.concatenate(preds), np.concatenate(trues)
+
+
+def median_filter_series(y: np.ndarray, kernel: int = 5) -> np.ndarray:
+    """홀수 커널 median filter (경계는 reflect)."""
+    k = int(kernel)
+    if k <= 1 or len(y) == 0:
+        return y
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    yp = np.pad(y.astype(np.float64), (pad, pad), mode="edge")
+    out = np.empty_like(y, dtype=np.float64)
+    for i in range(len(y)):
+        out[i] = np.median(yp[i : i + k])
+    return out.astype(y.dtype, copy=False)
 
 
 def resolve_report_path(out_dir: str) -> str:
@@ -518,9 +781,14 @@ def _existing_report_mae(report_path: str) -> float | None:
         return None
     try:
         with open(report_path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip().startswith("| MAE |"):
-                    return float(line.split("|")[2].strip())
+            text = f.read()
+        # 비교형 리포트(여러 실험)는 자동 덮어쓰기 방지: 헤더 best MAE 우선
+        m = re.search(r"MAE\s*\*\*([0-9.]+)\*\*", text)
+        if m:
+            return float(m.group(1))
+        for line in text.splitlines():
+            if line.strip().startswith("| MAE |"):
+                return float(line.split("|")[2].strip())
     except (OSError, ValueError, IndexError):
         return None
     return None
@@ -533,7 +801,9 @@ def write_experiment_report(
     val_losses: List[float],
     env_info: dict | None = None,
 ) -> str | None:
-    """단일 outputs/Experiment_Report.md에 best(MAE 최저) 결과만 기록합니다."""
+    """단일 outputs/Experiment_Report.md에 best(MAE 최저) 결과만 기록합니다.
+    비교형 리포트(실험 비교 섹션)가 있으면 덮어쓰지 않습니다.
+    """
     env_info = env_info or {}
     best_epoch = int(metrics.get("best_epoch", 0) or 0)
     best_val = float(metrics.get("best_val_loss", float("nan")))
@@ -545,6 +815,19 @@ def write_experiment_report(
     data_paths = metrics.get("data_paths", [])
 
     report_path = resolve_report_path(out_dir)
+    if os.path.isfile(report_path):
+        try:
+            with open(report_path, encoding="utf-8") as f:
+                existing = f.read()
+            if "## 실험 비교" in existing or "실험 비교 중" in existing:
+                print(
+                    f"[INFO] Experiment_Report.md 유지 "
+                    f"(비교형 리포트 — 수동 갱신 권장, 현재 MAE={mae:.6f})"
+                )
+                return None
+        except OSError:
+            pass
+
     prev_mae = _existing_report_mae(report_path)
     if prev_mae is not None and mae >= prev_mae:
         print(
@@ -604,7 +887,13 @@ def write_experiment_report(
 | window_stride | {metrics.get('window_stride', '')} |
 | batch_size | {metrics.get('batch_size', '')} |
 | learning_rate | {metrics.get('learning_rate', '')} |
+| weight_decay | {metrics.get('weight_decay', '')} |
+| dropout | {metrics.get('dropout', '')} |
+| patience (early stop) | {metrics.get('patience', '')} |
+| lr_factor / lr_patience | {metrics.get('lr_factor', '')} / {metrics.get('lr_patience', '')} |
 | epochs | {metrics.get('epochs', '')} |
+| epochs_ran | {metrics.get('epochs_ran', '')} |
+| stopped_early | {metrics.get('stopped_early', '')} |
 | best_epoch | {best_epoch} |
 
 ## Result
@@ -649,9 +938,9 @@ def write_experiment_report(
 - Validation loss가 epoch마다 흔들려 학습이 불안정한 구간이 있음.
 
 ### 다음 실험
-- Early stopping / learning rate scheduler 적용
-- 차량별 bias 보정 또는 성능이 낮은 차량 feature 재검토
-- pred_len / seq_len / patch 설정 비교 실험
+- 차량별 bias 보정 (`01241225220` 중심) 또는 차량별 정규화/fine-tuning
+- 예측 스파이크 후처리 및 Huber/MAE 손실 비교
+- seq_len / patch_len 비교 실험
 """
 
     os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
@@ -685,6 +974,7 @@ def save_artifacts(
     time_indices: List[int],
     metrics: dict,
     env_info: dict | None = None,
+    skip_report: bool = False,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
@@ -735,6 +1025,10 @@ def save_artifacts(
     plt.savefig(os.path.join(out_dir, "prediction.png"), dpi=140)
     plt.close()
 
+    if skip_report:
+        print("[INFO] Experiment_Report.md 자동 갱신 생략 (skip_report=True)")
+        return
+
     report_path = write_experiment_report(
         out_dir=out_dir,
         metrics=metrics,
@@ -753,13 +1047,23 @@ def build_checkpoint(
     feature_cols: List[str],
     target_col: str,
     args,
+    feature_scalers: dict | None = None,
+    target_scalers: dict | None = None,
+    per_vehicle_norm: bool = False,
+    vehicle_to_idx: dict | None = None,
 ) -> dict:
+    num_vehicles = int(getattr(args, "num_vehicles_emb", 0) or 0)
+    vehicle_emb_dim = int(getattr(args, "vehicle_emb_dim", 16) or 16)
     return {
         "model_state_dict": model.state_dict(),
         "feature_scaler": feature_scaler,
         "target_scaler": target_scaler,
         "x_scaler": feature_scaler,
         "y_scaler": target_scaler,
+        "feature_scalers": feature_scalers,
+        "target_scalers": target_scalers,
+        "per_vehicle_norm": per_vehicle_norm,
+        "vehicle_to_idx": vehicle_to_idx,
         "feature_cols": feature_cols,
         "target_col": target_col,
         "model_config": {
@@ -772,6 +1076,8 @@ def build_checkpoint(
             "ff_dim": args.ff_dim,
             "dropout": args.dropout,
             "num_features": len(feature_cols),
+            "num_vehicles": num_vehicles,
+            "vehicle_emb_dim": vehicle_emb_dim,
         },
     }
 
@@ -784,6 +1090,88 @@ def load_model_state(model: nn.Module, checkpoint_path: str, device: torch.devic
         model.load_state_dict(ckpt)
 
 
+def predict_vehicle_original(
+    model,
+    x_seg: np.ndarray,
+    y_seg: np.ndarray,
+    seq_len: int,
+    batch_size: int,
+    criterion,
+    device,
+    target_scaler: StandardScaler,
+    window_stride: int = 1,
+    vehicle_idx: int = 0,
+    use_vehicle_idx: bool = False,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """한 차량 구간에 대해 원본 스케일 true/pred를 반환합니다."""
+    ds = SlidingWindowDataset(
+        x_seg,
+        y_seg,
+        seq_len=seq_len,
+        pred_len=1,
+        window_stride=window_stride,
+        vehicle_idx=vehicle_idx,
+        return_vehicle_idx=use_vehicle_idx,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=2,
+        pin_memory=device.type == "cuda",
+    )
+    loss, pred_sc, true_sc = evaluate(model, loader, criterion, device)
+    pred = target_scaler.inverse_transform(pred_sc.reshape(-1, 1)).reshape(-1)
+    true = target_scaler.inverse_transform(true_sc.reshape(-1, 1)).reshape(-1)
+    return float(loss), true, pred
+
+
+def estimate_vehicle_biases(
+    model,
+    segments: List[Tuple[np.ndarray, np.ndarray]],
+    vehicle_ids: List[str],
+    seq_len: int,
+    batch_size: int,
+    criterion,
+    device,
+    target_scaler: StandardScaler,
+    target_scalers: dict | None = None,
+    vehicle_to_idx: dict | None = None,
+    use_vehicle_idx: bool = False,
+) -> dict:
+    """
+    Validation 구간에서 차량별 평균 bias(pred - true)를 추정합니다.
+    Test 적용 시 pred에서 이 값을 빼 보정합니다.
+    """
+    biases: dict = {}
+    for vid, (x_seg, y_seg) in zip(vehicle_ids, segments):
+        y_sc = (target_scalers or {}).get(vid, target_scaler)
+        vidx = int((vehicle_to_idx or {}).get(vid, 0))
+        _, true, pred = predict_vehicle_original(
+            model=model,
+            x_seg=x_seg,
+            y_seg=y_seg,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            criterion=criterion,
+            device=device,
+            target_scaler=y_sc,
+            window_stride=1,
+            vehicle_idx=vidx,
+            use_vehicle_idx=use_vehicle_idx,
+        )
+        bias = float(np.mean(pred - true))
+        biases[vid] = bias
+        mae = float(mean_absolute_error(true, pred))
+        mae_bc = float(mean_absolute_error(true, pred - bias))
+        print(
+            f"[BIAS] {vid}: val_bias={bias:+.4f} "
+            f"val_MAE={mae:.4f} -> {mae_bc:.4f} (corrected)"
+        )
+    return biases
+
+
 def evaluate_per_vehicle(
     model,
     segments: List[Tuple[np.ndarray, np.ndarray]],
@@ -793,6 +1181,11 @@ def evaluate_per_vehicle(
     criterion,
     device,
     target_scaler: StandardScaler,
+    vehicle_biases: dict | None = None,
+    target_scalers: dict | None = None,
+    vehicle_to_idx: dict | None = None,
+    use_vehicle_idx: bool = False,
+    median_kernel: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], List[int], dict, float]:
     """차량별 test 예측/지표를 계산하고 전체 결과를 합칩니다."""
     all_true: List[np.ndarray] = []
@@ -801,31 +1194,41 @@ def evaluate_per_vehicle(
     time_indices: List[int] = []
     vehicle_metrics: dict = {}
     scaled_losses: List[float] = []
+    biases = vehicle_biases or {}
 
     for vid, (x_seg, y_seg) in zip(vehicle_ids, segments):
-        ds = SlidingWindowDataset(
-            x_seg, y_seg, seq_len=seq_len, pred_len=1, window_stride=1
-        )
-        loader = DataLoader(
-            ds,
+        y_sc = (target_scalers or {}).get(vid, target_scaler)
+        vidx = int((vehicle_to_idx or {}).get(vid, 0))
+        loss, true, pred_raw = predict_vehicle_original(
+            model=model,
+            x_seg=x_seg,
+            y_seg=y_seg,
+            seq_len=seq_len,
             batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=2,
-            pin_memory=device.type == "cuda",
+            criterion=criterion,
+            device=device,
+            target_scaler=y_sc,
+            window_stride=1,
+            vehicle_idx=vidx,
+            use_vehicle_idx=use_vehicle_idx,
         )
-        loss, pred_sc, true_sc = evaluate(model, loader, criterion, device)
         scaled_losses.append(loss)
 
-        pred = target_scaler.inverse_transform(pred_sc.reshape(-1, 1)).reshape(-1)
-        true = target_scaler.inverse_transform(true_sc.reshape(-1, 1)).reshape(-1)
+        bias = float(biases.get(vid, 0.0))
+        pred = pred_raw - bias
+        if median_kernel and median_kernel > 1:
+            pred = median_filter_series(pred, kernel=median_kernel)
         mae = float(mean_absolute_error(true, pred))
         rmse = float(math.sqrt(mean_squared_error(true, pred)))
+        mae_raw = float(mean_absolute_error(true, pred_raw))
         vehicle_metrics[vid] = {
             "mae": mae,
             "rmse": rmse,
             "n": int(len(true)),
             "test_loss_scaled_mse": float(loss),
+            "bias_applied": bias,
+            "mae_before_bias": mae_raw,
+            "vehicle_idx": vidx,
         }
 
         all_true.append(true)
@@ -833,7 +1236,12 @@ def evaluate_per_vehicle(
         device_nos.extend([vid] * len(true))
         time_indices.extend(list(range(len(true))))
 
-        print(f"[TEST] {vid}: MAE={mae:.6f} RMSE={rmse:.6f} n={len(true)}")
+        extra = ""
+        if bias:
+            extra += f" bias={bias:+.4f} raw_MAE={mae_raw:.6f}"
+        if median_kernel and median_kernel > 1:
+            extra += f" median_k={median_kernel}"
+        print(f"[TEST] {vid}: MAE={mae:.6f} RMSE={rmse:.6f} n={len(true)}{extra}")
 
     y_true = np.concatenate(all_true)
     y_pred = np.concatenate(all_pred)
@@ -887,17 +1295,121 @@ def parse_args():
         help="슬라이딩 윈도우 시작점 간격. 클수록 샘플 수↓ 속도↑",
     )
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="AdamW weight decay (과적합 완화)",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Early stopping patience (val_loss 미개선 epoch 수). 0이면 비활성",
+    )
+    parser.add_argument(
+        "--lr_factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau 학습률 감소 배율",
+    )
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=2,
+        help="val_loss 미개선 시 LR 감소까지 기다리는 epoch 수",
+    )
+    parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--ff_dim", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument(
+        "--vehicle_bias_correct",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Validation에서 차량별 bias(pred-true)를 추정해 Test 예측에 보정 적용",
+    )
+    parser.add_argument(
+        "--per_vehicle_norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="차량별 train split으로 feature/target StandardScaler를 따로 fit",
+    )
+    parser.add_argument(
+        "--holdout_vehicle",
+        type=str,
+        default="",
+        help="LOVO: 해당 차량을 학습/검증에서 제외하고 Test만 수행 (ID 또는 끝자리)",
+    )
+    parser.add_argument(
+        "--calibrate_frac",
+        type=float,
+        default=0.0,
+        help="LOVO holdout의 Test 구간 앞부분 비율로 few-shot 캘리브레이션 (예: 0.1). 0이면 비활성",
+    )
+    parser.add_argument(
+        "--finetune_epochs",
+        type=int,
+        default=0,
+        help="캘리브레이션 구간으로 fine-tune할 epoch 수 (0이면 bias만)",
+    )
+    parser.add_argument(
+        "--finetune_lr",
+        type=float,
+        default=1e-4,
+        help="few-shot fine-tune 학습률",
+    )
+    parser.add_argument(
+        "--fix_zero_temp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="int_temp/ext_temp가 0·상수면 mod_avg_temp 등으로 대체 (178 대응)",
+    )
+    parser.add_argument(
+        "--vehicle_embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="차량 ID embedding을 모델에 주입 (unknown=0)",
+    )
+    parser.add_argument(
+        "--vehicle_emb_dim",
+        type=int,
+        default=16,
+        help="vehicle embedding 차원",
+    )
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="mse",
+        choices=["mse", "huber", "mae"],
+        help="학습 손실 함수",
+    )
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="HuberLoss delta",
+    )
+    parser.add_argument(
+        "--median_kernel",
+        type=int,
+        default=0,
+        help="예측 후처리 median filter 커널(홀수). 0이면 비활성",
+    )
+    parser.add_argument(
+        "--eval_checkpoint",
+        type=str,
+        default="",
+        help="지정 시 학습 없이 해당 체크포인트로 평가만 수행",
+    )
     return parser.parse_args()
 
 
@@ -924,7 +1436,31 @@ def main():
         time_col=args.time_col,
         feature_cols=feature_cols,
         sample_stride=args.sample_stride,
+        per_vehicle_norm=args.per_vehicle_norm,
+        holdout_vehicle=args.holdout_vehicle,
+        calibrate_frac=args.calibrate_frac,
+        fix_zero_temp=args.fix_zero_temp,
     )
+
+    # LOVO: 라벨 없는 새 차량 가정 → bias 비활성.
+    # 단, calibrate_frac>0 이면 few-shot 라벨로 bias/finetune 허용.
+    has_calib = bool(data.calib_segments) and float(data.calibrate_frac or 0) > 0
+    if data.holdout_vehicle and args.vehicle_bias_correct and not has_calib:
+        print(
+            f"[WARN] LOVO holdout={data.holdout_vehicle} → "
+            "vehicle_bias_correct 비활성화 (새 차량 가정). "
+            "few-shot은 --calibrate_frac 사용."
+        )
+        args.vehicle_bias_correct = False
+    if has_calib and not args.vehicle_bias_correct and args.finetune_epochs <= 0:
+        print(
+            "[INFO] calibrate_frac 사용 → vehicle_bias_correct 자동 활성화"
+        )
+        args.vehicle_bias_correct = True
+
+    use_vehicle_emb = bool(args.vehicle_embedding)
+    n_emb_vehicles = len(data.vehicle_to_idx or {}) if use_vehicle_emb else 0
+    args.num_vehicles_emb = n_emb_vehicles
 
     print(f"[INFO] target_col: {data.target_col}")
     print(f"[INFO] feature_count: {len(data.feature_cols)}")
@@ -933,81 +1469,287 @@ def main():
         f"[INFO] speed opts: sample_stride={args.sample_stride} "
         f"window_stride={args.window_stride} batch_size={args.batch_size} epochs={args.epochs}"
     )
-
-    train_ds = build_concat_dataset(
-        data.train_segments, seq_len=args.seq_len, window_stride=args.window_stride
+    print(f"[INFO] vehicle_bias_correct: {args.vehicle_bias_correct}")
+    print(f"[INFO] per_vehicle_norm: {data.per_vehicle_norm}")
+    print(f"[INFO] holdout_vehicle: {data.holdout_vehicle or '-'}")
+    print(
+        f"[INFO] calibrate_frac: {data.calibrate_frac} | "
+        f"finetune_epochs: {args.finetune_epochs} | finetune_lr: {args.finetune_lr}"
     )
-    val_ds = build_concat_dataset(
-        data.val_segments, seq_len=args.seq_len, window_stride=args.window_stride
+    print(f"[INFO] fix_zero_temp: {args.fix_zero_temp}")
+    print(
+        f"[INFO] vehicle_embedding: {use_vehicle_emb} "
+        f"(n={n_emb_vehicles}, dim={args.vehicle_emb_dim})"
     )
-    print(f"[INFO] train/val windows: {len(train_ds)}/{len(val_ds)}")
+    print(f"[INFO] loss: {args.loss} | median_kernel: {args.median_kernel}")
 
     pin = device.type == "cuda"
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=pin,
-        persistent_workers=args.num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=max(1, args.num_workers // 2),
-        pin_memory=pin,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    model = PatchTSTRegressor(
-        num_features=len(data.feature_cols),
-        seq_len=args.seq_len,
-        patch_len=args.patch_len,
-        stride=args.stride,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        ff_dim=args.ff_dim,
-        dropout=args.dropout,
-    ).to(device)
-
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    best_val = float("inf")
-    best_epoch = 0
-    train_losses: List[float] = []
-    val_losses: List[float] = []
-    best_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+    if args.loss == "huber":
+        criterion = nn.HuberLoss(delta=args.huber_delta)
+    elif args.loss == "mae":
+        criterion = nn.L1Loss()
+    else:
+        criterion = nn.MSELoss()
     env_info = collect_env_info(device)
 
-    for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        va_loss, _, _ = evaluate(model, val_loader, criterion, device)
-        train_losses.append(tr_loss)
-        val_losses.append(va_loss)
+    train_losses: List[float] = []
+    val_losses: List[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    stopped_early = False
+    best_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+    optimizer = None
 
-        if va_loss < best_val:
-            best_val = va_loss
-            best_epoch = epoch
-            torch.save(
-                build_checkpoint(
-                    model=model,
-                    feature_scaler=data.feature_scaler,
-                    target_scaler=data.target_scaler,
-                    feature_cols=data.feature_cols,
-                    target_col=data.target_col,
-                    args=args,
-                ),
-                best_path,
+    if args.eval_checkpoint:
+        ckpt_path = args.eval_checkpoint
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"eval_checkpoint 없음: {ckpt_path}")
+        print(f"[INFO] eval-only from checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        cfg = ckpt.get("model_config") or {}
+        feature_cols_ckpt = list(ckpt.get("feature_cols") or data.feature_cols)
+        model = PatchTSTRegressor(
+            num_features=int(cfg.get("num_features", len(feature_cols_ckpt))),
+            seq_len=int(cfg.get("seq_len", args.seq_len)),
+            patch_len=int(cfg.get("patch_len", args.patch_len)),
+            stride=int(cfg.get("stride", args.stride)),
+            d_model=int(cfg.get("d_model", args.d_model)),
+            nhead=int(cfg.get("nhead", args.nhead)),
+            num_layers=int(cfg.get("num_layers", args.num_layers)),
+            ff_dim=int(cfg.get("ff_dim", args.ff_dim)),
+            dropout=float(cfg.get("dropout", args.dropout)),
+            num_vehicles=int(cfg.get("num_vehicles", 0)),
+            vehicle_emb_dim=int(cfg.get("vehicle_emb_dim", args.vehicle_emb_dim)),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        args.seq_len = int(cfg.get("seq_len", args.seq_len))
+        use_vehicle_emb = int(cfg.get("num_vehicles", 0)) > 0
+        n_emb_vehicles = int(cfg.get("num_vehicles", 0))
+        args.num_vehicles_emb = n_emb_vehicles
+        if ckpt.get("vehicle_to_idx"):
+            data.vehicle_to_idx = ckpt["vehicle_to_idx"]
+        data = apply_checkpoint_scalers(data, ckpt)
+        best_path = ckpt_path
+        # 체크포인트와 같은 run 이름의 metrics를 우선 탐색
+        ckpt_run = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
+        cand_list = [
+            os.path.join(args.output_dir, "metrics.json"),
+            os.path.join("outputs", ckpt_run, "metrics.json"),
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(ckpt_path))),
+                "outputs",
+                ckpt_run,
+                "metrics.json",
+            ),
+            "outputs/run2_fast/metrics.json",
+        ]
+        for cand in cand_list:
+            if os.path.isfile(cand):
+                with open(cand, encoding="utf-8") as f:
+                    src = json.load(f)
+                if src.get("train_losses") or src.get("best_epoch"):
+                    train_losses = list(src.get("train_losses") or [])
+                    val_losses = list(src.get("val_losses") or [])
+                    best_epoch = int(src.get("best_epoch") or 0)
+                    best_val = float(src.get("best_val_loss") or float("inf"))
+                    print(f"[INFO] loaded train history from: {cand}")
+                    break
+    else:
+        train_ds = build_concat_dataset(
+            data.train_segments,
+            seq_len=args.seq_len,
+            window_stride=args.window_stride,
+            vehicle_ids=data.train_vehicle_ids,
+            vehicle_to_idx=data.vehicle_to_idx,
+            use_vehicle_idx=use_vehicle_emb,
+        )
+        val_ds = build_concat_dataset(
+            data.val_segments,
+            seq_len=args.seq_len,
+            window_stride=args.window_stride,
+            vehicle_ids=data.val_vehicle_ids,
+            vehicle_to_idx=data.vehicle_to_idx,
+            use_vehicle_idx=use_vehicle_emb,
+        )
+        print(f"[INFO] train/val windows: {len(train_ds)}/{len(val_ds)}")
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=args.num_workers,
+            pin_memory=pin,
+            persistent_workers=args.num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=max(1, args.num_workers // 2),
+            pin_memory=pin,
+            persistent_workers=args.num_workers > 0,
+        )
+
+        model = PatchTSTRegressor(
+            num_features=len(data.feature_cols),
+            seq_len=args.seq_len,
+            patch_len=args.patch_len,
+            stride=args.stride,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=args.num_layers,
+            ff_dim=args.ff_dim,
+            dropout=args.dropout,
+            num_vehicles=n_emb_vehicles,
+            vehicle_emb_dim=args.vehicle_emb_dim,
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.min_lr,
+        )
+        epochs_no_improve = 0
+
+        print(
+            f"[INFO] train stability: weight_decay={args.weight_decay} "
+            f"dropout={args.dropout} patience={args.patience} "
+            f"lr_factor={args.lr_factor} lr_patience={args.lr_patience}"
+        )
+
+        for epoch in range(1, args.epochs + 1):
+            tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            va_loss, _, _ = evaluate(model, val_loader, criterion, device)
+            train_losses.append(tr_loss)
+            val_losses.append(va_loss)
+
+            prev_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step(va_loss)
+            curr_lr = optimizer.param_groups[0]["lr"]
+            if curr_lr < prev_lr - 1e-15:
+                print(f"[INFO] LR reduced: {prev_lr:.2e} -> {curr_lr:.2e}")
+
+            if va_loss < best_val:
+                best_val = va_loss
+                best_epoch = epoch
+                epochs_no_improve = 0
+                torch.save(
+                    build_checkpoint(
+                        model=model,
+                        feature_scaler=data.feature_scaler,
+                        target_scaler=data.target_scaler,
+                        feature_cols=data.feature_cols,
+                        target_col=data.target_col,
+                        args=args,
+                        feature_scalers=data.feature_scalers,
+                        target_scalers=data.target_scalers,
+                        per_vehicle_norm=data.per_vehicle_norm,
+                        vehicle_to_idx=data.vehicle_to_idx,
+                    ),
+                    best_path,
+                )
+            else:
+                epochs_no_improve += 1
+
+            print(
+                f"[Epoch {epoch:03d}/{args.epochs}] "
+                f"train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={curr_lr:.2e}"
             )
 
-        print(f"[Epoch {epoch:03d}/{args.epochs}] train_loss={tr_loss:.6f} val_loss={va_loss:.6f}")
+            if args.patience > 0 and epochs_no_improve >= args.patience:
+                stopped_early = True
+                print(
+                    f"[INFO] Early stopping at epoch {epoch} "
+                    f"(no val improvement for {args.patience} epochs, best={best_epoch})"
+                )
+                break
 
-    load_model_state(model, best_path, device)
+        if not os.path.isfile(best_path):
+            raise RuntimeError(f"best checkpoint가 없습니다: {best_path}")
+        load_model_state(model, best_path, device)
+
+    test_vids = data.test_vehicle_ids or data.vehicle_ids
+    val_vids = data.val_vehicle_ids or data.vehicle_ids
+
+    # Few-shot: holdout 캘리브레이션 구간으로 fine-tune (+ 이후 bias)
+    finetune_losses: List[float] = []
+    if has_calib and args.finetune_epochs > 0:
+        calib_vids = data.calib_vehicle_ids or test_vids
+        ft_ds = build_concat_dataset(
+            data.calib_segments,
+            seq_len=args.seq_len,
+            window_stride=max(1, args.window_stride),
+            vehicle_ids=calib_vids,
+            vehicle_to_idx=data.vehicle_to_idx,
+            use_vehicle_idx=use_vehicle_emb,
+        )
+        ft_loader = DataLoader(
+            ft_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=max(1, args.num_workers // 2),
+            pin_memory=pin,
+        )
+        ft_opt = torch.optim.AdamW(
+            model.parameters(), lr=args.finetune_lr, weight_decay=args.weight_decay
+        )
+        print(
+            f"[INFO] few-shot fine-tune: epochs={args.finetune_epochs} "
+            f"lr={args.finetune_lr} windows={len(ft_ds)}"
+        )
+        for ep in range(1, args.finetune_epochs + 1):
+            ft_loss = train_one_epoch(model, ft_loader, ft_opt, criterion, device)
+            finetune_losses.append(ft_loss)
+            print(f"[FT {ep:02d}/{args.finetune_epochs}] loss={ft_loss:.6f}")
+        ft_ckpt = os.path.join(args.checkpoint_dir, "finetuned_model.pt")
+        torch.save(
+            build_checkpoint(
+                model=model,
+                feature_scaler=data.feature_scaler,
+                target_scaler=data.target_scaler,
+                feature_cols=data.feature_cols,
+                target_col=data.target_col,
+                args=args,
+                feature_scalers=data.feature_scalers,
+                target_scalers=data.target_scalers,
+                per_vehicle_norm=data.per_vehicle_norm,
+                vehicle_to_idx=data.vehicle_to_idx,
+            ),
+            ft_ckpt,
+        )
+        best_path = ft_ckpt
+        print(f"[INFO] saved finetuned checkpoint: {ft_ckpt}")
+
+    vehicle_biases = None
+    bias_segments = data.val_segments
+    bias_vids = val_vids
+    if has_calib:
+        bias_segments = data.calib_segments or data.val_segments
+        bias_vids = data.calib_vehicle_ids or val_vids
+    if args.vehicle_bias_correct:
+        print("[INFO] Estimating per-vehicle bias on validation/calib set...")
+        vehicle_biases = estimate_vehicle_biases(
+            model=model,
+            segments=bias_segments,
+            vehicle_ids=bias_vids,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            criterion=criterion,
+            device=device,
+            target_scaler=data.target_scaler,
+            target_scalers=data.target_scalers,
+            vehicle_to_idx=data.vehicle_to_idx,
+            use_vehicle_idx=use_vehicle_emb,
+        )
+
     (
         true,
         pred,
@@ -1018,17 +1760,24 @@ def main():
     ) = evaluate_per_vehicle(
         model=model,
         segments=data.test_segments,
-        vehicle_ids=data.vehicle_ids,
+        vehicle_ids=test_vids,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         criterion=criterion,
         device=device,
         target_scaler=data.target_scaler,
+        vehicle_biases=vehicle_biases,
+        target_scalers=data.target_scalers,
+        vehicle_to_idx=data.vehicle_to_idx,
+        use_vehicle_idx=use_vehicle_emb,
+        median_kernel=args.median_kernel,
     )
 
     mae = float(mean_absolute_error(true, pred))
     mse = float(mean_squared_error(true, pred))
     rmse = float(math.sqrt(mse))
+
+    final_lr = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else None
 
     metrics = {
         "device": str(device),
@@ -1045,10 +1794,36 @@ def main():
         "window_stride": args.window_stride,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
+        "epochs_ran": len(train_losses),
         "num_workers": args.num_workers,
         "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "dropout": args.dropout,
+        "patience": args.patience,
+        "lr_factor": args.lr_factor,
+        "lr_patience": args.lr_patience,
+        "min_lr": args.min_lr,
+        "stopped_early": stopped_early,
         "best_epoch": best_epoch,
-        "best_val_loss": best_val,
+        "best_val_loss": best_val if best_val < float("inf") else None,
+        "final_lr": final_lr,
+        "vehicle_bias_correct": bool(args.vehicle_bias_correct),
+        "vehicle_biases": vehicle_biases,
+        "per_vehicle_norm": bool(data.per_vehicle_norm),
+        "holdout_vehicle": data.holdout_vehicle or None,
+        "calibrate_frac": float(data.calibrate_frac or 0.0),
+        "finetune_epochs": int(args.finetune_epochs),
+        "finetune_lr": float(args.finetune_lr) if args.finetune_epochs > 0 else None,
+        "finetune_losses": finetune_losses,
+        "fix_zero_temp": bool(args.fix_zero_temp),
+        "vehicle_embedding": use_vehicle_emb,
+        "vehicle_emb_dim": args.vehicle_emb_dim if use_vehicle_emb else 0,
+        "num_vehicles_emb": n_emb_vehicles,
+        "vehicle_to_idx": data.vehicle_to_idx,
+        "loss": args.loss,
+        "huber_delta": args.huber_delta if args.loss == "huber" else None,
+        "median_kernel": args.median_kernel,
+        "eval_checkpoint": args.eval_checkpoint or None,
         "test_loss_scaled_mse": test_loss,
         "test_mae": mae,
         "test_mse": mse,
@@ -1066,24 +1841,101 @@ def main():
 
     save_artifacts(
         out_dir=args.output_dir,
-        train_losses=train_losses,
-        val_losses=val_losses,
+        train_losses=train_losses if train_losses else [0.0],
+        val_losses=val_losses if val_losses else [0.0],
         y_true=true,
         y_pred=pred,
         device_nos=device_nos,
         time_indices=time_indices,
         metrics=metrics,
         env_info=env_info,
+        skip_report=bool(args.eval_checkpoint),
     )
 
-    print(f"[DONE] Best Epoch: {best_epoch} (val_loss={best_val:.6f})")
+    print(f"[DONE] Best Epoch: {best_epoch} (val_loss={best_val})")
     print(f"[DONE] Test MAE:  {mae:.6f}")
     print(f"[DONE] Test MSE:  {mse:.6f}")
     print(f"[DONE] Test RMSE: {rmse:.6f}")
+    if vehicle_biases:
+        print(f"[DONE] vehicle biases: {vehicle_biases}")
     for vid, vm in vehicle_metrics.items():
         print(f"[DONE]   {vid}: MAE={vm['mae']:.6f} RMSE={vm['rmse']:.6f}")
     print(f"[DONE] outputs saved to: {args.output_dir}")
     print(f"[DONE] best checkpoint: {best_path}")
+
+
+def apply_checkpoint_scalers(data: DataBundle, ckpt: dict) -> DataBundle:
+    """
+    체크포인트의 scaler로 train/val/test segment를 다시 맞춥니다.
+    load_and_prepare_data가 이미 transform한 값이므로, inverse(현재)→transform(ckpt) 적용.
+    """
+    per_vehicle = bool(ckpt.get("per_vehicle_norm")) and bool(ckpt.get("target_scalers"))
+    if per_vehicle:
+        old_x_map = data.feature_scalers or {
+            vid: data.feature_scaler for vid in data.vehicle_ids
+        }
+        old_y_map = data.target_scalers or {
+            vid: data.target_scaler for vid in data.vehicle_ids
+        }
+        new_x_map = ckpt["feature_scalers"]
+        new_y_map = ckpt["target_scalers"]
+
+        def remap_seg(seg_list):
+            out = []
+            for vid, (x_sc, y_sc) in zip(data.vehicle_ids, seg_list):
+                x_raw = old_x_map[vid].inverse_transform(x_sc)
+                y_raw = old_y_map[vid].inverse_transform(y_sc.reshape(-1, 1)).reshape(-1)
+                out.append(
+                    (
+                        new_x_map[vid].transform(x_raw),
+                        new_y_map[vid].transform(y_raw.reshape(-1, 1)).reshape(-1),
+                    )
+                )
+            return out
+
+        data.train_segments = remap_seg(data.train_segments)
+        data.val_segments = remap_seg(data.val_segments)
+        data.test_segments = remap_seg(data.test_segments)
+        if data.calib_segments:
+            data.calib_segments = remap_seg(data.calib_segments)
+        data.feature_scalers = new_x_map
+        data.target_scalers = new_y_map
+        data.per_vehicle_norm = True
+        data.feature_scaler = ckpt.get("feature_scaler", data.feature_scaler)
+        data.target_scaler = ckpt.get("target_scaler", data.target_scaler)
+    else:
+        old_x = data.feature_scaler
+        old_y = data.target_scaler
+        new_x = ckpt["feature_scaler"]
+        new_y = ckpt["target_scaler"]
+
+        def remap_seg(seg_list):
+            out = []
+            for x_sc, y_sc in seg_list:
+                x_raw = old_x.inverse_transform(x_sc)
+                y_raw = old_y.inverse_transform(y_sc.reshape(-1, 1)).reshape(-1)
+                out.append(
+                    (
+                        new_x.transform(x_raw),
+                        new_y.transform(y_raw.reshape(-1, 1)).reshape(-1),
+                    )
+                )
+            return out
+
+        data.train_segments = remap_seg(data.train_segments)
+        data.val_segments = remap_seg(data.val_segments)
+        data.test_segments = remap_seg(data.test_segments)
+        if data.calib_segments:
+            data.calib_segments = remap_seg(data.calib_segments)
+        data.feature_scaler = new_x
+        data.target_scaler = new_y
+        data.per_vehicle_norm = False
+        data.feature_scalers = None
+        data.target_scalers = None
+
+    data.feature_cols = list(ckpt.get("feature_cols") or data.feature_cols)
+    data.target_col = ckpt.get("target_col") or data.target_col
+    return data
 
 
 if __name__ == "__main__":
